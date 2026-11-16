@@ -2,6 +2,7 @@
 
 #include <mystdlib.h>
 #include <meshing.hpp>
+#include <map>
 
 #include "occgeom.hpp"
 #include "occ_face.hpp"
@@ -231,7 +232,8 @@ namespace netgen
   }
 
   bool OCCMeshFace (const OCCGeometry & geom, Mesh & mesh, FlatArray<int, PointIndex> glob2loc,
-                       const MeshingParameters & mparam, int nr, int projecttype, bool delete_on_failure)
+                       const MeshingParameters & mparam, int nr, int projecttype, bool delete_on_failure,
+                       double maxh_scale)
   {
     auto k = nr+1;
     if(1==0 && !geom.fvispar[k-1].IsDrawable())
@@ -276,7 +278,7 @@ namespace netgen
     //      Meshing2OCCSurfaces meshing(f2, bb);
     // meshing.SetStartTime (starttime);
     //(*testout) << "Face " << k << endl << endl;
-    
+
 
     auto segments = geom.GetFace(k-1).GetBoundary(mesh);
 
@@ -416,6 +418,8 @@ namespace netgen
     // Philippose - 15/01/2009
     auto& props = occface.properties;
     double maxh = min2(geom.face_maxh[k-1], props.maxh);
+    if (maxh_scale != 1.0 && mparam.maxh < 1e98)
+      maxh = min2(maxh, mparam.maxh * maxh_scale);
     //double maxh = mparam.maxh;
     //      int noldpoints = mesh->GetNP();
     int noldsurfel = mesh.GetNSE();
@@ -426,7 +430,20 @@ namespace netgen
     GProp_GProps sprops;
     BRepGProp::SurfaceProperties(TopoDS::Face(geom.fmap(k)),sprops);
     tsurfprop.Stop();
-    meshing.SetMaxArea(2.*sprops.Mass());
+    const double facearea = sprops.Mass();
+    meshing.SetMaxArea(2.*facearea);
+
+    // A degenerate face (sliver / fully trimmed away) has ~zero surface area, so
+    // maxarea = 2*area is non-positive. Meshing2's overshoot guard is `if(maxarea > 0 ...)`,
+    // where maxarea <= 0 is the "no area limit" sentinel — so a zero-area face silently
+    // disables the guard and the advancing front runs away (millions of elements, front
+    // never empties: observed as an endless hang on imported surface shells). Such a face
+    // has nothing to mesh; skip it cleanly (0 elements, treated as handled, not failed).
+    if (facearea <= 0.0)
+      {
+        geom.facemeshstatus[k-1] = 1;
+        return false;
+      }
 
     MESHING2_RESULT res;
 
@@ -468,6 +485,112 @@ namespace netgen
     auto n_illegal_trigs = mesh.FindIllegalTrigs();
     PrintMessage (3, n_illegal_trigs, " illegal triangles");
     return meshing_failed;
+  }
+
+
+  // Mesh a face the advancing front gave up on by ear-clipping its existing
+  // boundary loop. Only boundary vertices already in the mesh are used, so the
+  // result stays conformal with the neighbouring faces. Meant for small
+  // degenerate (near-planar) faces; multi-loop boundaries are not handled.
+  bool OCCMeshFaceFromBoundary (const OCCGeometry & geom, Mesh & mesh, int nr)
+  {
+    int k = nr+1;
+    auto segments = geom.GetFace(k-1).GetBoundary(mesh);
+    size_t nseg = segments.Size();
+    if (nseg < 3 || nseg > 200) return false;
+
+    // chain segments into a single closed loop (multi-loop faces are skipped)
+    std::map<int,int> nxt;
+    for (size_t i = 0; i < nseg; i++)
+      {
+        int s = int(segments[i][0]);
+        if (nxt.count(s)) return false;          // non-manifold boundary
+        nxt[s] = int(i);
+      }
+    NgArray<PointIndex> loop;
+    PointIndex start = segments[0][0], cur = start;
+    for (size_t s = 0; s < nseg; s++)
+      {
+        loop.Append (cur);
+        auto it = nxt.find (int(cur));
+        if (it == nxt.end()) return false;
+        cur = segments[it->second][1];
+      }
+    if (cur != start) return false;              // open chain
+    int n = loop.Size();
+    if (n != (int)nseg) return false;            // more than one loop
+
+    // Newell normal + 2D basis
+    Vec<3> nrm(0,0,0);
+    for (int i = 0; i < n; i++)
+      {
+        Point<3> a = mesh[loop[i]], b = mesh[loop[(i+1)%n]];
+        nrm(0) += (a(1)-b(1))*(a(2)+b(2));
+        nrm(1) += (a(2)-b(2))*(a(0)+b(0));
+        nrm(2) += (a(0)-b(0))*(a(1)+b(1));
+      }
+    double nl = nrm.Length();
+    if (nl < 1e-30) return false;
+    nrm *= 1.0/nl;
+    Vec<3> u = (fabs(nrm(0)) < 0.9) ? Vec<3>(1,0,0) : Vec<3>(0,1,0);
+    u -= (u * nrm) * nrm;  u *= 1.0/u.Length();
+    Vec<3> v = Cross (nrm, u);
+
+    NgArray<double> px(n), py(n);
+    Point<3> orig = mesh[loop[0]];
+    for (int i = 0; i < n; i++)
+      {
+        Vec<3> d = mesh[loop[i]] - orig;
+        px[i] = d * u;  py[i] = d * v;
+      }
+
+    auto addTri = [&](PointIndex a, PointIndex b, PointIndex c)
+      {
+        Element2d el(3);
+        el.PNum(1) = a;  el.PNum(2) = b;  el.PNum(3) = c;
+        el.SetIndex (k);
+        mesh.AddSurfaceElement (el);
+      };
+
+    // ear clipping in the projected plane (loop is CCW w.r.t. Newell normal by construction)
+    NgArray<int> idx(n);
+    for (int i = 0; i < n; i++) idx[i] = i;
+    int remaining = n, guard = 0;
+    while (remaining > 3 && guard < 2*n*n)
+      {
+        bool clipped = false;
+        for (int i = 0; i < remaining && !clipped; i++, guard++)
+          {
+            int i0 = idx[(i+remaining-1)%remaining], i1 = idx[i], i2 = idx[(i+1)%remaining];
+            double ax=px[i0], ay=py[i0], bx=px[i1], by=py[i1], cx=px[i2], cy=py[i2];
+            double cr = (bx-ax)*(cy-ay) - (by-ay)*(cx-ax);
+            if (cr <= 0) continue;               // reflex corner
+            bool inside = false;
+            for (int j = 0; j < remaining && !inside; j++)
+              {
+                int p = idx[j];
+                if (p==i0 || p==i1 || p==i2) continue;
+                double d1 = (bx-ax)*(py[p]-ay) - (by-ay)*(px[p]-ax);
+                double d2 = (cx-bx)*(py[p]-by) - (cy-by)*(px[p]-bx);
+                double d3 = (ax-cx)*(py[p]-cy) - (ay-cy)*(px[p]-cx);
+                if (d1 >= 0 && d2 >= 0 && d3 >= 0) inside = true;
+              }
+            if (inside) continue;
+            addTri (loop[i0], loop[i1], loop[i2]);
+            for (int j = i; j < remaining-1; j++) idx[j] = idx[j+1];
+            remaining--;
+            clipped = true;
+          }
+        if (!clipped) break;                     // no ear found (degenerate) -> fan the rest
+      }
+    if (remaining == 3)
+      addTri (loop[idx[0]], loop[idx[1]], loop[idx[2]]);
+    else
+      for (int i = 1; i < remaining-1; i++)      // fallback fan (near-degenerate slivers)
+        addTri (loop[idx[0]], loop[idx[i]], loop[idx[i+1]]);
+
+    PrintMessage (3, "face ", k, ": meshed from boundary loop (", n, " points)");
+    return true;
   }
 
 
@@ -568,6 +691,7 @@ namespace netgen
             double s0, s1;
 
             Handle(Geom_Curve) c = BRep_Tool::Curve(e, s0, s1);
+            if (c.IsNull()) continue; // no 3D curve (not flagged degenerate): c->Value would crash
 
             const auto & props = gedge.properties;
             localh = min2(localh, props.maxh);
@@ -597,6 +721,7 @@ namespace netgen
             if (BRep_Tool::Degenerated(edge)) continue;
             double s0, s1;
             Handle(Geom_Curve) c = BRep_Tool::Curve(edge, s0, s1);
+            if (c.IsNull()) continue; // no 3D curve (not flagged degenerate): c->Value would crash
             BRepAdaptor_Curve brepc(edge);
             BRepLProp_CLProps prop(brepc, 2, 1e-5);
             auto layer = geom.GetEdge(edge).properties.layer;
@@ -638,8 +763,12 @@ namespace netgen
               {
                 if (geom.shape.Infinite())
                   throw Exception("Cannot generate mesh for an infinite geometry");
-                else
-                  throw Exception("OCC-Triangulation could not be built for face " + to_string(i));
+                // BRepMesh failed to triangulate this one face. Skip its curvature-based
+                // local mesh-size contribution instead of aborting the whole model — the
+                // face is still meshed later by MeshSurface. Throwing here made a single
+                // un-triangulatable face (common in large imported surface shells) discard
+                // the entire body's mesh.
+                continue;
               }
             
             BRepAdaptor_Surface sf(face, Standard_True);
