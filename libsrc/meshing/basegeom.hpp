@@ -192,6 +192,14 @@ namespace netgen
     Array<GeometryEdge*> free_edges; // edges with no adjacent face
   };
 
+  // ABI-inert hook (no vtable/layout change): a geometry backend may register a
+  // face-conflict grouper for the parallel meshing lane. Faces given the same
+  // group id share mutable geometry state (e.g. one Geom_Surface evaluator) and
+  // must not be meshed concurrently. Unset (or default ids) = fully independent.
+  class NetgenGeometry;
+  typedef void (*FaceConflictGrouperFunc)(const NetgenGeometry & geom, Array<int> & group);
+  DLL_HEADER extern FaceConflictGrouperFunc face_conflict_grouper;
+
   class DLL_HEADER NetgenGeometry
   {
     unique_ptr<Refinement> ref;
@@ -254,6 +262,10 @@ namespace netgen
     virtual void MeshSurface(Mesh& mesh, const MeshingParameters& mparam) const;
     virtual bool MeshFace(Mesh& mesh, const MeshingParameters& mparam,
                      int nr, FlatArray<int, PointIndex> glob2loc) const;
+    // Parallel face meshing lane (adaptive + uniform): clone-per-thread +
+    // deterministic merge; returns false to use the sequential loop instead.
+    bool TryMeshSurfaceParallel (Mesh & mesh, const MeshingParameters & mparam,
+                                 size_t & n_failed_faces) const;
     virtual void MapSurfaceMesh( Mesh & mesh, const GeometryFace & dst, std::map<tuple<PointIndex, int>, PointIndex> & mapto) const;
     virtual void OptimizeSurface(Mesh& mesh, const MeshingParameters& mparam) const;
 

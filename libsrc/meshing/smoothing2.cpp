@@ -969,7 +969,10 @@ namespace netgen
 	  
           Vector x(2);
 	  x = 0;
-	  par.typx = 0.3*ld.lochs[0];
+	  // lochs is only filled when uselocalh is set; reading lochs[0] otherwise is an
+	  // out-of-bounds read of an empty array (stack garbage / AV). Fall back to the
+	  // uniform local h (ld.loch = mp.maxh) as the BFGS step scale.
+	  par.typx = 0.3 * ((ld.uselocalh && ld.lochs.Size() > 0) ? ld.lochs[0] : ld.loch);
 
           // NgProfiler::StartTimer (timer2);
 

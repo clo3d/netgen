@@ -660,8 +660,8 @@ namespace netgen
 				      const float * bmax,
 				      NgArray<int> & pis) const
   {
-    static NgArray<ADTreeNode3Div*> stack(1000);
-    static NgArray<int> stackdir(1000);
+    static thread_local NgArray<ADTreeNode3Div*> stack(1000);
+    static thread_local NgArray<int> stackdir(1000);
     ADTreeNode3Div * node;
     int dir, i, stacks;
 
@@ -919,8 +919,8 @@ namespace netgen
 				    const float * bmax,
 				    NgArray<int> & pis) const
   {
-    static NgArray<ADTreeNode3M*> stack(1000);
-    static NgArray<int> stackdir(1000);
+    static thread_local NgArray<ADTreeNode3M*> stack(1000);
+    static thread_local NgArray<int> stackdir(1000);
     ADTreeNode3M * node;
     int dir, i, stacks;
 
@@ -1165,7 +1165,7 @@ namespace netgen
 				    const float * bmax,
 				    NgArray<int> & pis) const
   {
-    static NgArray<ADTreeNode3F*> stack(1000);
+    static thread_local NgArray<ADTreeNode3F*> stack(1000);
     ADTreeNode3F * node;
     int dir, i, stacks;
 
@@ -1429,7 +1429,7 @@ namespace netgen
 				     const float * bmax,
 				     NgArray<int> & pis) const
   {
-    static NgArray<ADTreeNode3FM*> stack(1000);
+    static thread_local NgArray<ADTreeNode3FM*> stack(1000);
     ADTreeNode3FM * node;
     int dir, i, stacks;
 
@@ -1702,7 +1702,7 @@ namespace netgen
 				   const float * bmax,
 				   NgArray<int> & pis) const
   {
-    // static NgArray<inttn6> stack(10000);
+    // static thread_local NgArray<inttn6> stack(10000);
     // stack.SetSize (10000);
     NgArrayMem<inttn6,10000> stack(10000);
     pis.SetSize(0);
@@ -1931,7 +1931,7 @@ namespace netgen
   void T_ADTree<dim,T> :: GetIntersecting (Point<dim> bmin, Point<dim> bmax,
                                            NgArray<T> & pis) const
   {
-    // static NgArray<inttn6> stack(10000);
+    // static thread_local NgArray<inttn6> stack(10000);
     // stack.SetSize (10000);
     NgArrayMem<inttn<dim,T>,10000> stack(10000);
     pis.SetSize(0);
@@ -2206,7 +2206,7 @@ namespace netgen
 				    const float * bmax,
 				    NgArray<int> & pis) const
   {
-    static NgArray<ADTreeNode6F*> stack(1000);
+    static thread_local NgArray<ADTreeNode6F*> stack(1000);
     ADTreeNode6F * node;
     int dir, i, stacks;
 

@@ -37,6 +37,8 @@
 #define OCC_HAVE_HISTORY
 #endif
 
+#include <mutex>
+
 namespace netgen
 {
 
@@ -160,6 +162,15 @@ namespace netgen
         {
           cerr << "WARNING: " << e.what() << endl;
         }
+      // The mutex serializes the lazy INSERT only (IndexedMap::Add + vector
+      // push_back raced under parallel face meshing). It does NOT protect the
+      // returned reference: a concurrent insert after return could still
+      // reallocate the vector. The parallel lane is safe because its grouper
+      // PRE-WARMS every face entry on the main thread before workers start --
+      // that pre-warm, not this mutex, is the load-bearing guarantee that
+      // workers only ever take the read path with stable references.
+      static std::mutex properties_mutex;
+      std::lock_guard<std::mutex> guard(properties_mutex);
       auto index = OCCGeometry::global_shape_property_indices.FindIndex(shape);
       if(index > 0)
         return OCCGeometry::global_shape_properties
@@ -174,6 +185,8 @@ namespace netgen
     }
     static std::vector<OCCIdentification>& GetIdentifications(const TopoDS_Shape& shape)
     {
+      static std::mutex identifications_mutex;   // same race class as GetProperties
+      std::lock_guard<std::mutex> guard(identifications_mutex);
       auto index = OCCGeometry::global_identification_indices.FindIndex(shape);
       if(index > 0)
         return OCCGeometry::global_identifications[index-1];
@@ -186,6 +199,10 @@ namespace netgen
       return OCCGeometry::global_identification_indices.FindIndex(shape) > 0;
     }
 
+    // facemeshstatus (below, via Analyse/MeshFace) is written CONCURRENTLY by the
+    // parallel face-meshing lane: each worker writes only its own face's slot, and
+    // the conflict grouping guarantees one worker per face. Disjoint int writes are
+    // race-free; do not change this to a growing/reallocating container.
     TopoDS_Shape shape;
     TopTools_IndexedMapOfShape fmap, emap, vmap, somap, shmap, wmap;
     NgArray<bool> fsingular, esingular, vsingular;

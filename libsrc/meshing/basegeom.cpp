@@ -4,8 +4,22 @@
 #include "meshing.hpp"
 #include <core/register_archive.hpp>
 
+#include <cstdlib>
+#include <atomic>
+#include <cstdio>
+#include <functional>
+#include <thread>
+#include <vector>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 namespace netgen
 {
+  FaceConflictGrouperFunc face_conflict_grouper = nullptr;
+
   struct PointTree
   {
       std::map<int, BoxTree<3>> tree;
@@ -847,6 +861,191 @@ namespace netgen
     return res != MESHING2_OK;
   }
 
+
+
+#ifdef _WIN32
+  // SEH trampoline: a structured exception (access violation) in a worker thread would
+  // otherwise terminate the process without a trace. No unwindable locals allowed here.
+  static int SEHGuardedCall (const std::function<void()> & fn,
+                             unsigned long * code, void ** addr)
+  {
+    __try
+      {
+        fn();
+        return 0;
+      }
+    __except (*code = GetExceptionCode(),
+              *addr = (GetExceptionInformation())->ExceptionRecord->ExceptionAddress,
+              EXCEPTION_EXECUTE_HANDLER)
+      {
+        return 1;
+      }
+  }
+#endif
+
+  // Parallel surface meshing lane (adaptive + uniform). Faces are independent once the
+  // edge mesh is fixed (each face meshes from its own boundary + its own geometry).
+  // Under uselocalh==0 (uniform) there is no shared size-field write at all.
+  // Under uselocalh==1 (adaptive) the size field is FROZEN before the lane starts
+  // (meshing2.cpp gates RestrictLocalH on !parallel_meshing), so reads are safe.
+  // Each worker owns a clone of the boundary-only mesh (clone preserves point indices,
+  // so boundary references need no remap); results merge into the global mesh in
+  // face-index order, reproducing the sequential point/element ordering exactly
+  // -> thread-count-invariant output.
+  bool NetgenGeometry :: TryMeshSurfaceParallel (Mesh & mesh, const MeshingParameters & mparam,
+                                                 size_t & n_failed_faces) const
+  {
+    if (!mparam.parallel_meshing || mparam.nthreads <= 1)
+      return false;
+    if (faces.Size() <= 1)
+      return false;
+    // closesurface-connecting or identified faces write shared mesh state -> sequential path
+    for (auto & fptr : faces)
+      if (fptr->primary != fptr.get() || fptr->IsConnectingCloseSurfaces())
+        return false;
+
+    int nthreads = mparam.nthreads;
+    int hw = (int) std::thread::hardware_concurrency();
+    if (hw > 0 && nthreads > hw) nthreads = hw;
+    if ((int) faces.Size() < nthreads) nthreads = (int) faces.Size();
+    if (nthreads <= 1) return false;
+
+    // Same FaceDescriptor/BCName prelude as the sequential loop, in face order.
+    for (auto k : Range(faces))
+      {
+        auto & face = *faces[k];
+        FaceDescriptor fd(k+1, face.domin+1, face.domout+1, k+1);
+        if (face.properties.col)
+          fd.SetSurfColour(*face.properties.col);
+        mesh.AddFaceDescriptor(fd);
+        mesh.SetBCName(k, face.properties.GetName());
+      }
+
+    struct FaceResult { int np0=0, np1=0, se0=0, se1=0, clone=-1; bool failed=false; };
+    Array<FaceResult> results(faces.Size());
+
+    Array<std::unique_ptr<Mesh>> clones(nthreads);
+    for (auto i : Range(nthreads))
+      {
+        clones[i] = std::make_unique<Mesh>();
+        *clones[i] = mesh;   // boundary + descriptors snapshot; point indices preserved
+        // Adaptive: share the frozen size field (operator= does not copy lochfunc; the
+        // field is read-only during the lane, so a shared_ptr copy is correct and free).
+        // Layer 1 only: multi-layer fields come from closesurface identifications,
+        // which this lane already bails out on above.
+        if (mparam.uselocalh)
+          clones[i]->SetLocalH(mesh.GetLocalH(1), 1);
+      }
+
+    // Conflict groups: faces sharing mutable geometry state (same surface handle)
+    // are chained into one work unit so no two workers touch that state at once.
+    Array<int> conflict(faces.Size());
+    if (face_conflict_grouper)
+      (*face_conflict_grouper)(*this, conflict);
+    else
+      for (auto k : Range(faces))
+        conflict[k] = (int) k;
+    Array<int> group_head(faces.Size());   // group leaders, in ascending face order
+    Array<int> group_next(faces.Size());   // singly-linked chain of each group's faces
+    group_next = -1;
+    Array<int> group_tail(faces.Size());
+    group_tail = -1;
+    int ngroups = 0;
+    for (auto k : Range(faces))
+      {
+        int g = conflict[k];
+        if (group_tail[g] < 0)
+          { group_head[ngroups++] = (int) k; group_tail[g] = (int) k; }
+        else
+          { group_next[group_tail[g]] = (int) k; group_tail[g] = (int) k; }
+      }
+
+    std::atomic<int> next{0};
+    std::atomic<int> ndone{0};
+    std::atomic<bool> aborted{false};
+    auto worker = [&](int tid)
+      {
+        Mesh & m = *clones[tid];
+        Array<int, PointIndex> g2l(m.GetNP());
+        while (!multithread.terminate && !aborted.load(std::memory_order_relaxed))
+          {
+            int gi = next.fetch_add(1);
+            if (gi >= ngroups) break;
+            for (int k = group_head[gi]; k >= 0; k = group_next[k])
+              {
+                FaceResult r;
+                r.clone = tid;
+                r.np0 = m.GetNP();  r.se0 = m.GetNSE();
+#ifdef _WIN32
+                unsigned long seh_code = 0; void * seh_addr = nullptr;
+                if (SEHGuardedCall([&]{ r.failed = MeshFace(m, mparam, k, g2l); },
+                                   &seh_code, &seh_addr) != 0)
+                  {
+                    fprintf(stderr, "netgen parallel meshing: exception on face %d (code=%08lx addr=%p base=%p), aborting\n",
+                            k, seh_code, seh_addr, (void*)GetModuleHandleA("nglib.dll"));
+                    fflush(stderr);
+                    aborted.store(true, std::memory_order_relaxed);
+                    break;
+                  }
+#else
+                try { r.failed = MeshFace(m, mparam, k, g2l); }
+                catch (...) { aborted.store(true, std::memory_order_relaxed); break; }
+#endif
+                r.np1 = m.GetNP();  r.se1 = m.GetNSE();
+                results[k] = r;
+                multithread.percent = 100.0 * (++ndone) / (double) faces.Size();
+              }
+          }
+      };
+
+    {
+      std::vector<std::thread> pool;
+      for (int t = 0; t < nthreads; t++)
+        pool.emplace_back(worker, t);
+      for (auto & th : pool)
+        th.join();
+    }
+
+    if (multithread.terminate || aborted.load())
+      throw NgException ("Meshing stopped");
+
+    // Deterministic merge in face order.
+    for (auto k : Range(faces))
+      {
+        const FaceResult & r = results[k];
+        if (r.clone < 0)
+          continue;
+        Mesh & m = *clones[r.clone];
+        Array<PointIndex> remap(r.np1 - r.np0);
+        for (int i = 0; i < r.np1 - r.np0; i++)
+          {
+            PointIndex cpi (PointIndex::BASE + r.np0 + i);
+            const MeshPoint & mp = m.Point(cpi);
+            remap[i] = mesh.AddPoint(mp, mp.GetLayer(), mp.Type());
+          }
+        for (int sei = r.se0; sei < r.se1; sei++)
+          {
+            Element2d el = m.SurfaceElement(SurfaceElementIndex(sei));
+            for (int j = 0; j < el.GetNP(); j++)
+              {
+                int idx = el[j] - PointIndex::BASE;
+                if (idx >= r.np0)                     // this face's own interior point
+                  el[j] = remap[idx - r.np0];
+                // idx < r.np0: a boundary point, already global-correct (the clone
+                // preserved indices). INVARIANT: when several faces share a clone
+                // (one conflict group), this range also contains the SIBLING faces'
+                // interior points -- a face's elements must never reference those,
+                // which holds because faces share only boundary points. Keep the
+                // grouping/merge in sync with this if either ever changes.
+              }
+            mesh.AddSurfaceElement(el);
+          }
+        if (r.failed)
+          n_failed_faces++;
+      }
+    return true;
+  }
+
   void NetgenGeometry :: MeshSurface(Mesh& mesh,
                                      const MeshingParameters& mparam) const
   {
@@ -857,6 +1056,7 @@ namespace netgen
 
     size_t n_failed_faces = 0;
     Array<int, PointIndex> glob2loc(mesh.GetNP());
+    if (!TryMeshSurfaceParallel(mesh, mparam, n_failed_faces))
     for(auto k : Range(faces))
     {
         auto & face = *faces[k];
@@ -1305,6 +1505,17 @@ namespace netgen
 
     // copy so that we don't change them outside
     MeshingParameters mparam = mp;
+
+    // Field-level debug overrides (NG_MESSAGE_LEVEL precedent). The primary control
+    // remains the MeshingParameters fields; overriding here (the single copy point)
+    // keeps the freeze gate, the parallel lane and the log guards on one signal.
+    if (const char* e = std::getenv("NG_PARALLEL_MESHING"))
+      mparam.parallel_meshing = (std::atoi(e) != 0);
+    if (const char* e = std::getenv("NG_NTHREADS"))
+      {
+        int n = std::atoi(e);
+        mparam.nthreads = (n > 0) ? n : 1;
+      }
     if(restricted_h.Size())
       for(const auto& [pnt, maxh] : restricted_h)
         mparam.meshsize_points.Append({pnt, maxh});
@@ -1321,7 +1532,9 @@ namespace netgen
       return 0;
 
     if(mparam.perfstepsstart <= MESHCONST_MESHEDGES)
-      FindEdges(*mesh, mparam);
+      {
+        FindEdges(*mesh, mparam);
+      }
 
     if(multithread.terminate || mparam.perfstepsend <= MESHCONST_MESHEDGES)
       return 0;

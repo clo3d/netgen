@@ -473,7 +473,7 @@ namespace netgen
 	    break;
 	  }
 
-	if (trials % 1000 == 0)
+	if (trials % 1000 == 0 && !mp.parallel_meshing)
 	  {
 	    (*testout) << "\n";
 	    for (int i = 1; i <= canuse.Size(); i++)
@@ -496,7 +496,10 @@ namespace netgen
 	double hshould = CalcLocalH (pmid, mesh.GetH (pmid, layer));
 	if (gh < hshould) hshould = gh;
 
-	mesh.RestrictLocalH (pmid, hshould);
+	// parallel_meshing contract: the size field is FROZEN after the analysis phase
+	// (no mid-mesh feedback), which is what makes faces independent for the lane.
+	if (mp.uselocalh && !mp.parallel_meshing)
+	  mesh.RestrictLocalH (pmid, hshould);
 
 	double h = hshould;
 

@@ -858,8 +858,8 @@ int CalcSphereCenter (const Point<3> ** pts, Point<3> & c)
 
 int CalcTriangleCenter (const Point3d ** pts, Point3d & c)
 {
-  static DenseMatrix a(2), inva(2);
-  static Vector rs(2), sol(2);
+  static thread_local DenseMatrix a(2), inva(2);   // shared scratch races under parallel face meshing
+  static thread_local Vector rs(2), sol(2);
   double h = Dist(*pts[0], *pts[1]);
 
   Vec3d v1(*pts[0], *pts[1]);

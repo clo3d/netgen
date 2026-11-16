@@ -67,6 +67,9 @@
 
 namespace netgen
 {
+  // fwd decl: defined next to OCCGeometry::MeshFace below, registered in the ctor
+  static void OCCFaceConflictGrouper (const NetgenGeometry & geom, Array<int> & group);
+
   void LoadOCCInto(OCCGeometry* occgeo, const filesystem::path & filename);
   void PrintContents (OCCGeometry * geom);
 
@@ -149,6 +152,8 @@ namespace netgen
 
   OCCGeometry::OCCGeometry(const TopoDS_Shape& _shape, int aoccdim, bool copy)
   {
+    face_conflict_grouper = &OCCFaceConflictGrouper;   // parallel-lane grouping hook (ABI-inert)
+
     if(copy)
       {
         auto filename = GetTempFilename();
@@ -243,6 +248,38 @@ namespace netgen
     OCCSetLocalMeshSize(*this, mesh, mparam, occparam);
   }
 
+  // Faces that share one underlying Geom_Surface handle must not be meshed
+  // concurrently: several OCCT surface types (offset / revolution / extrusion)
+  // evaluate through a mutable per-handle cache that is not thread-safe. Group
+  // such faces so the parallel lane keeps them on a single worker. Registered
+  // through the ABI-inert basegeom hook (adding a virtual would change the
+  // vtable layout old-header consumers were compiled against).
+  static void OCCFaceConflictGrouper (const NetgenGeometry & geom, Array<int> & group)
+  {
+    for (int k = 0; k < group.Size(); k++)
+      group[k] = k;                                    // safe default: independent
+    if (geom.GetGeomType() != Mesh::GEOM_OCC)
+      return;
+    const OCCGeometry & occ = static_cast<const OCCGeometry&>(geom);
+    if (occ.fmap.Extent() < group.Size())
+      return;
+    std::map<const Geom_Surface*, int> first;
+    for (int k = 0; k < group.Size(); k++)
+      {
+        TopoDS_Face face = TopoDS::Face(occ.fmap(k+1));
+        // LOAD-BEARING: pre-warm the properties entry on the main thread. Workers
+        // read GetProperties(face) concurrently; only because every entry already
+        // exists do they take the read-only path with stable references (see the
+        // GetProperties comment -- the insert mutex alone would not save them).
+        OCCGeometry::GetProperties(face);
+        TopLoc_Location loc;                                       // 2-arg overload: no copy,
+        Handle(Geom_Surface) surf = BRep_Tool::Surface(face, loc); // stable handle identity
+        if (surf.IsNull())
+          continue;
+        auto it = first.emplace(surf.get(), k).first;
+        group[k] = it->second;
+      }
+  }
   bool OCCGeometry :: MeshFace(Mesh& mesh,
                                   const MeshingParameters& mparam, int nr, FlatArray<int, PointIndex> glob2loc) const
   {
