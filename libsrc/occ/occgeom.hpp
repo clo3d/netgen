@@ -128,6 +128,10 @@ namespace netgen
     /// Enable / Disable use of the minimum edge length (by default use 1e-4)
     int resthminedgelenenable = false;
 
+    /// Keep the partial surface mesh of faces that could not be meshed
+    /// completely (leaves open border edges; disabled by default)
+    bool keep_partial_mesh = false;
+
     /*!
       Dump all the OpenCascade specific meshing parameters 
       to console
@@ -454,7 +458,12 @@ namespace netgen
                                              const OCCParameters& occparam);
 
   DLL_HEADER extern bool OCCMeshFace (const OCCGeometry & geom, Mesh & mesh, FlatArray<int, PointIndex> glob2loc,
-                       const MeshingParameters & mparam, int nr, int projecttype, bool delete_on_failure);
+                       const MeshingParameters & mparam, int nr, int projecttype, bool delete_on_failure,
+                       double maxh_scale = 1.0);
+
+  // fallback for faces the advancing front cannot mesh: triangulate the
+  // face's existing boundary loop directly (conformal with neighbour faces)
+  DLL_HEADER extern bool OCCMeshFaceFromBoundary (const OCCGeometry & geom, Mesh & mesh, int nr);
 
   inline auto GetModified(BRepBuilderAPI_MakeShape & builder, TopoDS_Shape shape) { return builder.Modified(shape); }
   inline auto GetModified(BRepTools_History & history, TopoDS_Shape shape) { return history.Modified(shape); }

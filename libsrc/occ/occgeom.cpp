@@ -253,6 +253,18 @@ namespace netgen
 
     bool failed = OCCMeshFace(*this, mesh, glob2loc, local_mp, nr, PARAMETERSPACE, true);
     if(failed)
+        failed = OCCMeshFace(*this, mesh, glob2loc, local_mp, nr, PLANESPACE, true);
+    // retry with reduced mesh size (front collisions on badly trimmed faces
+    // often resolve at finer h), then triangulate the boundary loop directly
+    if(failed)
+        failed = OCCMeshFace(*this, mesh, glob2loc, local_mp, nr, PARAMETERSPACE, true, 0.3);
+    if(failed)
+        failed = OCCMeshFace(*this, mesh, glob2loc, local_mp, nr, PLANESPACE, true, 0.3);
+    if(failed)
+        failed = !OCCMeshFaceFromBoundary(*this, mesh, nr);
+    // keeping a partial mesh leaves open border edges, which is usually worse
+    // than skipping the face; opt in via OCCParameters::keep_partial_mesh
+    if(failed && occparam.keep_partial_mesh)
         failed = OCCMeshFace(*this, mesh, glob2loc, local_mp, nr, PLANESPACE, false);
 
     if(failed)
@@ -1215,7 +1227,8 @@ namespace netgen
           auto e = emap(i1);
           auto edge = TopoDS::Edge(e);
           auto verts = GetVertices(e);
-          if(verts.size() == 0)
+          // Need two endpoints for GetVertex(verts[1]); a degenerate edge can expose fewer.
+          if(verts.size() < 2)
             continue;
           auto occ_edge = make_unique<OCCEdge>(edge, GetVertex(verts[0]), GetVertex(verts[1]) );
           if(HaveProperties(edge))
