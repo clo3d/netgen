@@ -290,6 +290,11 @@ namespace netgen
     int trials = 0, nfaces = 0;
     int oldnl = 0;
 
+    // stall detection: trials without a new surface element (see below)
+    constexpr int STALL_MAXTRIALS = 2000;
+    int stall_nse = -1;
+    int stall_lastprogress = 0;
+
     UpdateVisSurfaceMeshData(oldnl, locpointsptr, loclinesptr, plainpointsptr);
 
     int qualclass;
@@ -453,7 +458,20 @@ namespace netgen
 
 	nfaces = adfront.GetNFL();
 	trials ++;
-    
+
+	// give up if the front made no progress for many trials
+	// (degenerate geometry can leave the front unable to apply any rule;
+	//  a total-trials limit would instead abort large healthy faces)
+	if (int(mesh.GetNSE()) != stall_nse)
+	  {
+	    stall_nse = mesh.GetNSE();
+	    stall_lastprogress = trials;
+	  }
+	else if (trials - stall_lastprogress > STALL_MAXTRIALS)
+	  {
+	    PrintMessage (3, "give up face, no progress for ", STALL_MAXTRIALS, " trials");
+	    break;
+	  }
 
 	if (trials % 1000 == 0)
 	  {
