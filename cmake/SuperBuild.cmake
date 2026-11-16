@@ -149,9 +149,18 @@ if(BUILD_ZLIB)
   list(APPEND NETGEN_DEPENDENCIES project_zlib)
   if(WIN32)
     # force linking the static library
+    # zlib's own CMake appends CMAKE_DEBUG_POSTFIX ("d") to the static library in a
+    # Debug build, so this name is config-dependent. Hardcoding the release name makes
+    # BUILD_ZLIB=ON fail a Debug build with "zlibstatic.lib missing and no known rule to
+    # make it" -- the ExternalProject really did build it, as zlibstaticd.lib.
+    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+      set(_netgen_zlib_static zlibstaticd.lib)
+    else()
+      set(_netgen_zlib_static zlibstatic.lib)
+    endif()
     set(ZLIB_INCLUDE_DIRS ${ZLIB_ROOT}/include)
-    set(ZLIB_LIBRARIES ${ZLIB_ROOT}/lib/zlibstatic.lib)
-    set(ZLIB_LIBRARY_RELEASE ${ZLIB_ROOT}/lib/zlibstatic.lib)
+    set(ZLIB_LIBRARIES ${ZLIB_ROOT}/lib/${_netgen_zlib_static})
+    set(ZLIB_LIBRARY_RELEASE ${ZLIB_ROOT}/lib/${_netgen_zlib_static})
   else(WIN32)
     set(ZLIB_INCLUDE_DIRS ${ZLIB_ROOT}/include)
     set(ZLIB_LIBRARIES ${ZLIB_ROOT}/lib/libz.a)
